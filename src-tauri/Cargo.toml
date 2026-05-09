@@ -1,0 +1,17 @@
+[package]
+name = "map-coordinate-binder"
+version = "0.1.0"
+description = "A Tauri tool for binding R6 blueprint pixels to in-game XYZ coordinates"
+authors = ["R6 map coordinate binder"]
+edition = "2021"
+
+[lib]
+name = "map_coordinate_binder_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
