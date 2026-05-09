@@ -11,6 +11,8 @@
     Trash2,
     Upload,
   } from "lucide-svelte";
+  import { save } from "@tauri-apps/plugin-dialog";
+  import { writeTextFile } from "@tauri-apps/plugin-fs";
 
   type FloorImage = {
     id: string;
@@ -76,6 +78,47 @@
     notes: string;
   };
 
+  type Transform = {
+    a: number;
+    b: number;
+    c: number;
+    d: number;
+    e: number;
+    f: number;
+  };
+
+  type ErrorRow = {
+    label: string;
+    actualPixelX: number;
+    actualPixelY: number;
+    predictedPixelX: number;
+    predictedPixelY: number;
+    errorPixels: number;
+  };
+
+  type FloorResult = {
+    floorId: string;
+    floorLabel: string;
+    pointCount: number;
+    transform: Transform;
+    originPixelX: number;
+    originPixelY: number;
+    averageErrorPixels: number;
+    maxErrorPixels: number;
+    pointErrors: ErrorRow[];
+  };
+
+  type AffineIssue = {
+    floorId: string;
+    floorLabel: string;
+    message: string;
+  };
+
+  type AffineReport = {
+    results: FloorResult[];
+    issues: AffineIssue[];
+  };
+
   const storageKey = "r6-coordinate-binder-state";
   const defaultFloorNames = ["Basement", "1F", "2F", "3F", "Roof"];
 
@@ -110,6 +153,8 @@
     : [];
   $: selectedPoint =
     points.find((point) => point.id === selectedId) ?? null;
+  $: missingFloorImageCount = floors.filter((floor) => !floor.url).length;
+  $: affineReport = buildAffineReport();
   $: exportPayload = {
     version: 2 as const,
     mapName,
@@ -142,6 +187,10 @@
           : [];
         points = Array.isArray(v2.points) ? v2.points : [];
         activeFloorId = v2.activeFloorId ?? floors[0]?.id ?? null;
+        if (floors.length > 0) {
+          statusMessage =
+            "Saved project restored. Re-add this map's floor images to show the map backgrounds.";
+        }
       } else {
         const legacy = parsed as Partial<LegacyExportFile>;
         const floorId = crypto.randomUUID();
@@ -170,6 +219,10 @@
               floorLabel: legacy.floorName || "Floor 1",
             }))
           : [];
+        if (floors.length > 0) {
+          statusMessage =
+            "Saved project restored. Re-add this map's floor images to show the map backgrounds.";
+        }
       }
     } catch {
       localStorage.removeItem(storageKey);
@@ -203,8 +256,12 @@
     });
   }
 
-  function downloadJson(filename: string, payload: ExportFile) {
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+  function sanitizeFilename(value: string) {
+    return value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "-").trim();
+  }
+
+  function downloadJson(filename: string, json: string) {
+    const blob = new Blob([json], {
       type: "application/json",
     });
     const url = URL.createObjectURL(blob);
@@ -217,17 +274,231 @@
     URL.revokeObjectURL(url);
   }
 
+  async function saveJsonFile(filename: string, json: string, label: string) {
+    const tauriWindow = window as Window & { __TAURI_INTERNALS__?: unknown };
+
+    if (!tauriWindow.__TAURI_INTERNALS__) {
+      downloadJson(filename, json);
+      statusMessage = `Exported ${label}. Check your browser downloads.`;
+      return;
+    }
+
+    try {
+      const selectedPath = await save({
+        defaultPath: filename,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+
+      if (!selectedPath) {
+        statusMessage = `${label} export canceled.`;
+        return;
+      }
+
+      const outputPath = selectedPath.toLowerCase().endsWith(".json")
+        ? selectedPath
+        : `${selectedPath}.json`;
+      await writeTextFile(outputPath, json);
+      statusMessage = `Exported ${label} to ${outputPath}.`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      statusMessage = `${label} export failed: ${message}`;
+    }
+  }
+
+  async function exportBindings() {
+    const filename = `${sanitizeFilename(mapName) || "r6-map"}-layered-bindings.json`;
+    await saveJsonFile(filename, JSON.stringify(exportPayload, null, 2), "bindings");
+  }
+
+  function solve3x3(a: number[][], b: number[]) {
+    const matrix = [
+      [a[0][0], a[0][1], a[0][2], b[0]],
+      [a[1][0], a[1][1], a[1][2], b[1]],
+      [a[2][0], a[2][1], a[2][2], b[2]],
+    ];
+
+    for (let col = 0; col < 3; col += 1) {
+      let pivot = col;
+      for (let row = col + 1; row < 3; row += 1) {
+        if (Math.abs(matrix[row][col]) > Math.abs(matrix[pivot][col])) {
+          pivot = row;
+        }
+      }
+
+      if (Math.abs(matrix[pivot][col]) < 1e-12) {
+        throw new Error("matrix is singular; points may be collinear or too clustered");
+      }
+
+      if (pivot !== col) {
+        [matrix[col], matrix[pivot]] = [matrix[pivot], matrix[col]];
+      }
+
+      const divisor = matrix[col][col];
+      for (let j = col; j < 4; j += 1) {
+        matrix[col][j] /= divisor;
+      }
+
+      for (let row = 0; row < 3; row += 1) {
+        if (row === col) continue;
+
+        const factor = matrix[row][col];
+        for (let j = col; j < 4; j += 1) {
+          matrix[row][j] -= factor * matrix[col][j];
+        }
+      }
+    }
+
+    return [matrix[0][3], matrix[1][3], matrix[2][3]];
+  }
+
+  function computeLeastSquaresAffine(floorPoints: BindingPoint[]): Transform {
+    if (floorPoints.length < 3) {
+      throw new Error("need at least 3 points");
+    }
+
+    const ata = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    const atx = [0, 0, 0];
+    const aty = [0, 0, 0];
+
+    for (const point of floorPoints) {
+      const row = [point.game.x, point.game.y, 1];
+
+      for (let i = 0; i < 3; i += 1) {
+        for (let j = 0; j < 3; j += 1) {
+          ata[i][j] += row[i] * row[j];
+        }
+
+        atx[i] += row[i] * point.pixel.x;
+        aty[i] += row[i] * point.pixel.y;
+      }
+    }
+
+    const xCoefficients = solve3x3(ata, atx);
+    const yCoefficients = solve3x3(ata, aty);
+
+    return {
+      a: xCoefficients[0],
+      b: xCoefficients[1],
+      c: xCoefficients[2],
+      d: yCoefficients[0],
+      e: yCoefficients[1],
+      f: yCoefficients[2],
+    };
+  }
+
+  function gameToPixel(gameX: number, gameY: number, transform: Transform) {
+    return {
+      x: transform.a * gameX + transform.b * gameY + transform.c,
+      y: transform.d * gameX + transform.e * gameY + transform.f,
+    };
+  }
+
+  function evaluateFloor(floorId: string, floorPoints: BindingPoint[], transform: Transform) {
+    let totalError = 0;
+    let maxError = 0;
+    const pointErrors = floorPoints.map((point) => {
+      const predicted = gameToPixel(point.game.x, point.game.y, transform);
+      const dx = predicted.x - point.pixel.x;
+      const dy = predicted.y - point.pixel.y;
+      const errorPixels = Math.sqrt(dx * dx + dy * dy);
+
+      totalError += errorPixels;
+      maxError = Math.max(maxError, errorPixels);
+
+      return {
+        label: point.label,
+        actualPixelX: point.pixel.x,
+        actualPixelY: point.pixel.y,
+        predictedPixelX: predicted.x,
+        predictedPixelY: predicted.y,
+        errorPixels,
+      };
+    });
+    const origin = gameToPixel(0, 0, transform);
+
+    return {
+      floorId,
+      floorLabel: floorPoints[0]?.floorLabel ?? "",
+      pointCount: floorPoints.length,
+      transform,
+      originPixelX: origin.x,
+      originPixelY: origin.y,
+      averageErrorPixels: totalError / floorPoints.length,
+      maxErrorPixels: maxError,
+      pointErrors,
+    };
+  }
+
+  function buildAffineReport(): AffineReport {
+    const floorIds = new Set([...floors.map((floor) => floor.id), ...points.map((point) => point.floorId)]);
+    const results: FloorResult[] = [];
+    const issues: AffineIssue[] = [];
+
+    for (const floorId of floorIds) {
+      const floorPoints = points.filter((point) => point.floorId === floorId);
+      const floor = floors.find((item) => item.id === floorId);
+      const floorLabel = floor?.label ?? floorPoints[0]?.floorLabel ?? floorId;
+
+      if (floorPoints.length === 0) continue;
+
+      if (floorPoints.length < 3) {
+        issues.push({
+          floorId,
+          floorLabel,
+          message: `Need at least 3 points, got ${floorPoints.length}.`,
+        });
+        continue;
+      }
+
+      try {
+        results.push(evaluateFloor(floorId, floorPoints, computeLeastSquaresAffine(floorPoints)));
+      } catch (error) {
+        issues.push({
+          floorId,
+          floorLabel,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return {
+      results: results.sort((a, b) => a.floorLabel.localeCompare(b.floorLabel)),
+      issues: issues.sort((a, b) => a.floorLabel.localeCompare(b.floorLabel)),
+    };
+  }
+
+  async function exportAffineTransforms() {
+    if (affineReport.results.length === 0) {
+      statusMessage = "Add at least 3 non-collinear bindings on a floor before exporting affine transforms.";
+      return;
+    }
+
+    const filename = `${sanitizeFilename(mapName) || "r6-map"}-affine-transforms.json`;
+    await saveJsonFile(
+      filename,
+      JSON.stringify(affineReport.results, null, 2),
+      "affine transforms",
+    );
+  }
+
   async function loadFloorImages(fileList: FileList | null) {
     const files = Array.from(fileList ?? []).sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { numeric: true }),
     );
     if (files.length === 0) return;
 
-    let accepted: FloorImage[] = [];
+    let nextFloors = [...floors];
+    const reconnectedFloorIds: string[] = [];
+    let addedCount = 0;
+    let reconnectedCount = 0;
     let rejected = 0;
     let baseSize = imageSize;
 
-    for (const file of files) {
+    for (const [fileIndex, file] of files.entries()) {
       const url = URL.createObjectURL(file);
       try {
         const size = await readImageSize(url);
@@ -241,10 +512,35 @@
           continue;
         }
 
-        const order = floors.length + accepted.length;
-        accepted = [
-          ...accepted,
-          {
+        const missingIndexByName = nextFloors.findIndex(
+          (floor) => !floor.url && floor.name === file.name,
+        );
+        const missingIndexByOrder = nextFloors.findIndex(
+          (floor) => !floor.url && floor.order === fileIndex,
+        );
+        const existingIndex =
+          missingIndexByName >= 0 ? missingIndexByName : missingIndexByOrder;
+
+        if (existingIndex >= 0) {
+          const existingFloor = nextFloors[existingIndex];
+          nextFloors = nextFloors.map((floor, index) =>
+            index === existingIndex
+              ? {
+                  ...floor,
+                  name: file.name,
+                  url,
+                  width: size.width,
+                  height: size.height,
+                }
+              : floor,
+          );
+          reconnectedFloorIds.push(existingFloor.id);
+          reconnectedCount += 1;
+        } else {
+          const order = nextFloors.length;
+          nextFloors = [
+            ...nextFloors,
+            {
             id: crypto.randomUUID(),
             name: file.name,
             label: floorLabelForFile(file, order),
@@ -253,29 +549,42 @@
             height: size.height,
             order,
           },
-        ];
+          ];
+          addedCount += 1;
+        }
       } catch {
         URL.revokeObjectURL(url);
         rejected += 1;
       }
     }
 
-    if (accepted.length === 0) {
+    if (addedCount + reconnectedCount === 0) {
       statusMessage = rejected
         ? "No images were added because their dimensions did not match."
         : "";
       return;
     }
 
-    floors = [...floors, ...accepted].sort((a, b) => a.order - b.order);
+    floors = nextFloors
+      .map((floor, index) => ({ ...floor, order: index }))
+      .sort((a, b) => a.order - b.order);
     imageSize = baseSize;
-    activeFloorId = activeFloorId ?? accepted[0].id;
+    if (!activeFloor?.url) {
+      activeFloorId =
+        reconnectedFloorIds[0] ?? floors.find((floor) => floor.url)?.id ?? null;
+    }
     pendingPixel = null;
     selectedId = null;
+    const loadedMessage =
+      reconnectedCount > 0 && addedCount > 0
+        ? `Reconnected ${reconnectedCount} saved floor image(s) and added ${addedCount} new floor image(s).`
+        : reconnectedCount > 0
+          ? `Reconnected ${reconnectedCount} saved floor image(s).`
+          : `Added ${addedCount} floor image(s).`;
     statusMessage =
       rejected > 0
-        ? `Added ${accepted.length} floor image(s). Skipped ${rejected} dimension mismatch.`
-        : `Added ${accepted.length} floor image(s).`;
+        ? `${loadedMessage} Skipped ${rejected} dimension mismatch.`
+        : loadedMessage;
   }
 
   function updateFloorLabel(floorId: string, label: string) {
@@ -291,6 +600,52 @@
     activeFloorId = floorId;
     pendingPixel = null;
     selectedId = null;
+  }
+
+  function removeFloor(floorId: string) {
+    const floor = floors.find((item) => item.id === floorId);
+    if (!floor) return;
+
+    if (floor.url) URL.revokeObjectURL(floor.url);
+
+    const remainingFloors = floors
+      .filter((item) => item.id !== floorId)
+      .map((item, index) => ({ ...item, order: index }));
+
+    floors = remainingFloors;
+    points = points.filter((point) => point.floorId !== floorId);
+    activeFloorId =
+      activeFloorId === floorId
+        ? remainingFloors[0]?.id ?? null
+        : activeFloorId;
+    imageSize = remainingFloors.length > 0 ? imageSize : null;
+    pendingPixel = null;
+    selectedId = null;
+    statusMessage = `Removed ${floor.label}.`;
+  }
+
+  function clearMap() {
+    const hasWork = floors.length > 0 || points.length > 0 || mapName.trim() !== "";
+    if (hasWork && !window.confirm("Clear this map and remove all images and bindings?")) {
+      return;
+    }
+
+    for (const floor of floors) {
+      if (floor.url) URL.revokeObjectURL(floor.url);
+    }
+
+    localStorage.removeItem(storageKey);
+    imageElement = null;
+    floors = [];
+    activeFloorId = null;
+    imageSize = null;
+    mapName = "";
+    points = [];
+    selectedId = null;
+    pendingPixel = null;
+    draft = emptyDraft();
+    resetView();
+    statusMessage = "Map cleared.";
   }
 
   function capturePixel(event: MouseEvent) {
@@ -454,11 +809,20 @@
       class="icon-button"
       type="button"
       title="Export JSON bindings"
-      on:click={() =>
-        downloadJson(`${mapName || "r6-map"}-layered-bindings.json`, exportPayload)}
+      on:click={() => void exportBindings()}
     >
       <Download size={18} />
       <span>Export</span>
+    </button>
+
+    <button
+      class="icon-button danger"
+      type="button"
+      title="Clear current map"
+      on:click={clearMap}
+    >
+      <Trash2 size={18} />
+      <span>Exit Map</span>
     </button>
   </section>
 
@@ -467,17 +831,32 @@
       <div class="field-grid single">
         <label>
           <span>Map</span>
-          <input bind:value={mapName} placeholder="Oregon" />
+          <input bind:value={mapName} placeholder="Map name" />
         </label>
       </div>
 
       <div class="image-meta">
         <FileJson size={17} />
-        <span>{activeFloor?.name || "No floor image loaded"}</span>
+        <span>
+          {#if activeFloor?.url}
+            {activeFloor.name}
+          {:else if activeFloor}
+            Missing image: {activeFloor.name}
+          {:else}
+            No floor image loaded
+          {/if}
+        </span>
         {#if imageSize}
           <strong>{imageSize.width} x {imageSize.height}</strong>
         {/if}
       </div>
+
+      {#if missingFloorImageCount > 0}
+        <div class="status-message">
+          {missingFloorImageCount} saved floor image{missingFloorImageCount === 1 ? "" : "s"}
+          need to be re-added. Click Floors and select the map images again.
+        </div>
+      {/if}
 
       {#if statusMessage}
         <div class="status-message">{statusMessage}</div>
@@ -497,11 +876,20 @@
                 on:input={(event) =>
                   updateFloorLabel(floor.id, event.currentTarget.value)}
               />
+              <button
+                class="delete-floor"
+                type="button"
+                title={`Remove ${floor.label}`}
+                aria-label={`Remove ${floor.label}`}
+                on:click={() => removeFloor(floor.id)}
+              >
+                <Trash2 size={16} />
+              </button>
             </div>
           {/each}
 
           {#if floors.length === 0}
-            <div class="empty-list">Add the Oregon floor images together.</div>
+            <div class="empty-list">Add this map's floor images together.</div>
           {/if}
         </div>
       </div>
@@ -706,7 +1094,7 @@
           <div class="empty-state">
             <ImagePlus size={42} />
             <h2>Add aligned floor images</h2>
-            <p>Select all five Oregon images at once. Same-size images share the same pixel grid across floors.</p>
+            <p>Select the floor images for one map at once. Same-size images share the same pixel grid across floors.</p>
           </div>
         {/if}
       </div>
@@ -716,6 +1104,45 @@
       <div class="bindings-header">
         <h2>Bindings</h2>
         <span>{points.length}</span>
+      </div>
+
+      <div class="affine-panel">
+        <div class="bindings-header">
+          <h2>Affine</h2>
+          <span>{affineReport.results.length}</span>
+        </div>
+        <button
+          class="wide-button secondary"
+          type="button"
+          disabled={affineReport.results.length === 0}
+          on:click={() => void exportAffineTransforms()}
+        >
+          Export Affine JSON
+        </button>
+
+        {#if affineReport.results.length > 0}
+          <div class="affine-list">
+            {#each affineReport.results as result (result.floorId)}
+              <div class="affine-row">
+                <strong>{result.floorLabel}</strong>
+                <span>{result.pointCount} points</span>
+                <span>avg {formatPixel(result.averageErrorPixels)} px</span>
+                <span>max {formatPixel(result.maxErrorPixels)} px</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#if affineReport.issues.length > 0}
+          <div class="affine-list">
+            {#each affineReport.issues as issue (issue.floorId)}
+              <div class="affine-row warning">
+                <strong>{issue.floorLabel}</strong>
+                <span>{issue.message}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
 
       <div class="bindings-list">

@@ -83,7 +83,7 @@ src-tauri/target/release/bundle/
 Floor images must have the same width and height. The app rejects images that do
 not match the first loaded floor image.
 
-For example, if all Oregon floor images are `1600 x 900` and share the same
+For example, if all floor images for a map are `1600 x 900` and share the same
 world alignment, pixel `(800, 450)` refers to the same horizontal location on
 every floor. The selected floor and in-game `z` value distinguish basement,
 middle-floor, and upper-floor points.
