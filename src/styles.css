@@ -201,6 +201,11 @@ textarea:focus {
   font-size: 13px;
 }
 
+.pixel-readout.compact {
+  min-height: 0;
+  margin-top: 0;
+}
+
 .image-meta span {
   min-width: 0;
   overflow: hidden;
@@ -281,6 +286,66 @@ textarea:focus {
   color: #cad4dc;
   font-size: 12px;
   font-weight: 800;
+}
+
+.shot-card {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #2d3741;
+  border-radius: 8px;
+  background: #10161c;
+}
+
+.shot-card-header,
+.shot-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shot-card-header {
+  justify-content: space-between;
+}
+
+.shot-card-header strong {
+  color: #f7fafc;
+  font-size: 13px;
+}
+
+.shot-card-header span,
+.shot-grid span {
+  color: #9eabb6;
+  font-size: 12px;
+}
+
+.shot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.shot-controls button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  background: #202832;
+  color: #dce4ea;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.shot-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.button-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 100px);
+  gap: 8px;
 }
 
 .wide-button {
@@ -402,7 +467,8 @@ textarea:focus {
 }
 
 .marker,
-.pending-marker {
+.pending-marker,
+.located-marker {
   position: absolute;
   width: 24px;
   height: 24px;
@@ -430,6 +496,16 @@ textarea:focus {
   border: 3px solid #ffffff;
   background: rgba(241, 178, 74, 0.4);
   box-shadow: 0 0 0 4px rgba(241, 178, 74, 0.24);
+  pointer-events: none;
+}
+
+.located-marker {
+  display: grid;
+  place-items: center;
+  border: 2px solid #ffffff;
+  background: #4bc0a4;
+  color: #0b1d18;
+  box-shadow: 0 0 0 5px rgba(75, 192, 164, 0.3);
   pointer-events: none;
 }
 
